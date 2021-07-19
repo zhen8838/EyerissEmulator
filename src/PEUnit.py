@@ -1,6 +1,7 @@
+from __future__ import annotations
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Dict
 import torch
 import torch.nn.functional as F
 
@@ -74,11 +75,12 @@ class LogicalPE():
     # oc, ic, wh = self.weights_index
     # oh = (ih - wh) // self.stride_h
     # NOTE 显示oh维护心智模型的一致性。
-    line_str = [f"{'weight':^12} {'ifmap':^12}"]
-    w_str = self.weights_index.__str__()
-    f_str = self.ifmap_index.__str__()
-    line_str.extend([f'{w:^12} {f:^12}' for w, f in zip(w_str.splitlines(), f_str.splitlines())])
-    return '\r' + '\n'.join(line_str)
+    # line_str = [f"{'weight':^12} {'ifmap':^12}"]
+    # w_str = self.weights_index.__str__()
+    # f_str = self.ifmap_index.__str__()
+    # line_str.extend([f'{w:^12} {f:^12}' for w, f in zip(w_str.splitlines(), f_str.splitlines())])
+    # return '\r' + '\n'.join(line_str)
+    return f'<{self.weights_index},{self.ifmap_index}>'
 
   @property
   def p(self):
@@ -141,37 +143,43 @@ class LogicalPE():
 
 
 class LogicalPEset(np.ndarray):
+  settings: Dict[str, int] = None
+  max_height: int = None
+  max_width: int = None
+  max_weight_spad: int = None
+  max_psum_spad: int = None
+  max_fmap_spad: int = None
 
-  def __new__(cls, ifmap: NDArray[np.float32], weight: NDArray[np.float32],
-              out_shape: List[int], n: int, oc: int, ic: int,
-              stride: Union[int, Tuple[int, int]]):
-    # 根据当前类型构建一个array obj, 调用__array_finalize__设定新的方法
-    dtype = LogicalPE
-    buffer = None
-    offset = 0
-    strides = None
-    order = None
-    buffer = LogicalPEset.from_one_conv2d(ifmap, weight, out_shape, n, oc, ic, stride)
-    obj = super().__new__(cls, buffer.shape, dtype,
-                          buffer, offset, strides, order)
-    obj.n = n
-    obj.oc = oc
-    obj.ic = ic
+  def __new__(subtype, data, **settings):
+    if isinstance(data, LogicalPEset):
+      return data
+    if isinstance(data, np.ndarray):
+      buffer = np.array(data, dtype=LogicalPE)
+    else:
+      buffer = np.array(data, dtype=LogicalPE, copy=True)
+    obj = np.ndarray.__new__(subtype, buffer.shape, buffer.dtype, buffer)
+    obj.settings = settings
+    for k, v in settings.items():
+      setattr(obj, k, v)
     return obj
 
   def __array_finalize__(self, obj):
     if obj is None:
       return
-    self.info = getattr(obj, 'info', None)
-    self.n = getattr(obj, 'n', None)
-    self.oc = getattr(obj, 'oc', None)
-    self.ic = getattr(obj, 'ic', None)
+
+    if type(obj) is np.ndarray:
+      raise NotImplementedError("Unsupport create object by view cast")
+
+    if type(obj) is LogicalPEset:
+      setattr(self, 'settings', getattr(obj, 'settings'))
+      for k, v in getattr(obj, 'settings').items():
+        setattr(self, k, v)
 
   @staticmethod
-  def from_one_conv2d(ifmap: NDArray[np.float32], weight: NDArray[np.float32],
+  def load_one_conv2d(ifmap: NDArray[np.float32], weight: NDArray[np.float32],
                       out_shape: List[int],
-                      n: int, oc: int, ic: int,
-                      strides: Tuple[int, int]) -> NDArray[LogicalPE]:
+                      b: int, oc: int, ic: int,
+                      strides: Tuple[int, int]) -> NDArray:
     if isinstance(ifmap, torch.Tensor):
       ifmap = ifmap.numpy()
     if isinstance(weight, torch.Tensor):
@@ -182,36 +190,43 @@ class LogicalPEset(np.ndarray):
       for oh in range(out_shape[2]):
         ih = strides[0] * oh + wh
         sets.append(
-            LogicalPE((n, ic, ih),
-                      ifmap[n, ic, ih]
+            LogicalPE((b, ic, ih),
+                      ifmap[b, ic, ih]
                       if ih < ifmap.shape[2]
-                      else np.zeros(ifmap[n, ic, -1].shape),  # padding zero when in
+                      else np.zeros(ifmap[b, ic, -1].shape),  # padding zero when in
                       (oc, ic, wh),
                       weight[oc, ic, wh],
                       strides))
       msets.append(sets)
-    return np.array(msets)
+    return np.array(msets, dtype=LogicalPE)
 
-  @staticmethod
-  def from_conv2d(ifmap: NDArray[np.float32], weight: NDArray[np.float32], out_shape: List[int], stride: Union[int, Tuple[int, int]]) -> NDArray[LogicalPE]:
+  def from_one_conv2d(self, ifmap: NDArray[np.float32], weight: NDArray[np.float32],
+                      out_shape: List[int],
+                      b: int, oc: int, ic: int,
+                      strides: Tuple[int, int]) -> LogicalPEset:
+    return LogicalPEset(LogicalPEset.load_one_conv2d(
+        ifmap, weight, out_shape,
+        b, oc, ic, strides),
+        **self.settings)
+
+  def from_conv2d(self, ifmap: NDArray[np.float32], weight: NDArray[np.float32], out_shape: List[int], strides: Union[int, Tuple[int, int]]) -> LogicalPEset:
     layer_pes = []
     for b in range(ifmap.shape[0]):
       for oc in range(weight.shape[0]):
         for ic in range(weight.shape[1]):
-          layer_pes.append(LogicalPEset.from_one_conv2d(
+          layer_pes.append(LogicalPEset.load_one_conv2d(
               ifmap, weight, out_shape,
-              b, oc, ic, stride))
+              b, oc, ic, strides))
     layer_pes = np.array(layer_pes, dtype=LogicalPE)
-    layer_pes = layer_pes.reshape(
-        ifmap.shape[0], weight.shape[0], weight.shape[1], *layer_pes.shape[1:])
-    return layer_pes
+    layer_pes = layer_pes.reshape(ifmap.shape[0], weight.shape[0],
+                                  weight.shape[1], *layer_pes.shape[1:])
+    return LogicalPEset(layer_pes, **self.settings)
 
-  @staticmethod
-  def spad_ic_fusion(layer_set: NDArray, q: int) -> NDArray:
+  def spad_ic_fusion(self, q: int) -> NDArray:
     # q个一组合并in channels，weights reuse，也就是in channel pack，先把ic移动到最后维度然后进行concat
-    B, OC, IC, KH, OH = layer_set.shape
+    B, OC, IC, KH, OH = self.shape
     split_factor = int(IC / q)
-    ic_splits = np.split(layer_set, split_factor, axis=2)
+    ic_splits = np.split(self, split_factor, axis=2)
     new_layer_set = []
     for ic_split in ic_splits:
       ic_split_q = np.moveaxis(ic_split, 2, -1)
@@ -219,28 +234,76 @@ class LogicalPEset(np.ndarray):
       pes = ic_split_q[0, 0, 0, 0]
       packed_pes = np.apply_along_axis(lambda pes: LogicalPE.from_pack(pes), -1, ic_split_q)
       new_layer_set.append(packed_pes)
-    return np.stack(new_layer_set, 2)  # 再合并到ic维度
+    # 再合并到ic维度
+    return LogicalPEset(np.stack(new_layer_set, 2), **self.settings)
 
-  @staticmethod
-  def spad_oc_fusion(layer_set: NDArray, q: int) -> NDArray:
-    layer_set = LogicalPEset.spad_oc_fusion(layer_set, p)
-    B, OC, IC, KH, OH = layer_set.shape
+  def spad_oc_fusion(self, p: int) -> NDArray:
+    # p 合并多个out channels，此时多个psum不可融合，所以需要concat来做。
+    B, OC, IC, KH, OH = self.shape
     split_factor = int(OC / p)
-    oc_splits = np.split(layer_set, split_factor, axis=1)
+    oc_splits = np.split(self, split_factor, axis=1)
     new_layer_set = []
     for oc_split in oc_splits:
-      oc_split.shape
       oc_split_p = np.moveaxis(oc_split, 1, -1)
-      pes = oc_split_p[0, 0, 0, 0]
+      # pes = oc_split_p[0, 0, 0, 0]
       concated_pes = np.apply_along_axis(lambda pes: LogicalPE.from_concat(pes), -1, oc_split_p)
       new_layer_set.append(concated_pes)
-    return np.stack(layer_set, 1)  # 再合并到oc维度
+    # 再合并到oc维度
+    return LogicalPEset(np.stack(new_layer_set, 1), **self.settings)
 
-  @staticmethod
-  def spad_fusion(layer_set: NDArray, p=16, q=1, S=3, Weight_Spad=224, Psum_Spad=24, Fmap_Spad=12):
-    assert(p * q * S < Weight_Spad and p < Psum_Spad and q * S < Fmap_Spad)
-    if q > 1:
-      layer_set = LogicalPEset.spad_ic_fusion(layer_set, q)
-    if p > 1:
-      layer_set = LogicalPEset.spad_oc_fusion(layer_set, q)
+  def strip_mining(self, width: int) -> List[LogicalPEset]:
+    B, OC, IC, KH, OH = self.shape
+    if KH > self.max_height:
+      raise ValueError(f"the eyeriss not support kernel size {KH} > {self.max_height}")
+    if OH > self.max_width:
+      split_factor = int(np.ceil(OH / width))
+      splited_sets = np.array_split(self, split_factor, -1)
+    return splited_sets
+
+  def spatail_fusion_common(self, param: int, axis: int):
+    shape = list(self.shape)
+    B, OC, IC, KH, OH = shape
+    splited_shape = shape.copy()
+    splited_shape.insert(axis + 1, param)
+    splited_shape[axis] = splited_shape[axis] // param
+    # NOTE 虽然可以任意映射,但是必须满足w或者h放下concat
+    if shape[axis] > param and ((OH * param <= self.max_width) or (KH * param <= self.max_height)):
+      layer_set = self.reshape(*splited_shape)
+      if OH * param <= self.max_width:
+        layer_set = np.moveaxis(layer_set, axis, -1)
+        merged_shape = list(layer_set.shape)
+        merged_shape[-2] *= merged_shape[-1]
+        merged_shape.pop(-1)
+      elif KH * param <= self.max_height:
+        layer_set = np.moveaxis(layer_set, axis, -2)
+        merged_shape = list(layer_set.shape)
+        merged_shape[-3] *= merged_shape[-2]
+        merged_shape.pop(-2)
+      layer_set = layer_set.reshape(*merged_shape)
+    else:
+      raise ValueError(f"the param = {param} can't merge on h = {KH} w = {OH}")
     return layer_set
+
+  def spatail_ic_fusion(self, r: int):
+    return self.spatail_fusion_common(r, axis=2)
+
+  def spatail_oc_fusion(self, t: int):
+    return self.spatail_fusion_common(t, axis=1)
+
+  def spad_fusion(self, p=16, q=1, S=3) -> LogicalPEset:
+    assert(p * q * S < self.max_weight_spad and p <
+           self.max_psum_spad and q * S < self.max_fmap_spad)
+    new_sets = self
+    if q > 1:
+      new_sets = new_sets.spad_ic_fusion(q)
+    if p > 1:
+      new_sets = new_sets.spad_oc_fusion(p)
+    return new_sets
+
+  def spatial_fusion(self, t=1, r=1) -> LogicalPEset:
+    new_sets = self
+    if t > 1:
+      new_sets = new_sets.spatail_oc_fusion(t)
+    if r > 1:
+      new_sets = new_sets.spatail_ic_fusion(r)
+    return new_sets
